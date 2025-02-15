@@ -2,6 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -34,8 +38,14 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    private val semaphore = Semaphore(parallelRequests)
+    private val rateLimiter = RateLimiter(rateLimitPerSec)
+
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        rateLimiter.acquire()
+        semaphore.acquire()
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
@@ -85,6 +95,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            semaphore.release()
         }
     }
 
@@ -97,3 +109,35 @@ class PaymentExternalSystemAdapterImpl(
 }
 
 public fun now() = System.currentTimeMillis()
+
+class RateLimiter(private val permitsPerSecond: Int) {
+    private var availableTokens = permitsPerSecond
+    private var nextRefillTime = now() + 1000
+    private val mutex = Mutex()
+
+    suspend fun acquire() {
+        mutex.withLock {
+            while (true) {
+                refillTokens()
+                when {
+                    availableTokens > 0 -> {
+                        availableTokens--
+                        return
+                    }
+                    else -> {
+                        val waitTime = nextRefillTime - now()
+                        if (waitTime > 0) delay(waitTime)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun refillTokens() {
+        val now = now()
+        if (now >= nextRefillTime) {
+            availableTokens = permitsPerSecond
+            nextRefillTime = now + 1000
+        }
+    }
+}
