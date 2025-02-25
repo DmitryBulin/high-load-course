@@ -44,9 +44,6 @@ class PaymentExternalSystemAdapterImpl(
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        rateLimiter.acquire()
-        semaphore.acquire()
-
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
@@ -54,6 +51,30 @@ class PaymentExternalSystemAdapterImpl(
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
+
+        semaphore.acquire()
+
+        if (willCompleteAfterDeadline(deadline)) {
+            logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough parallel requests")
+            paymentESService.update(paymentId) {
+                it.logProcessing(success =false, now(), transactionId, reason = "Request would complete after deadline. No point in processing")
+            }
+
+            semaphore.release()
+            return
+        }
+
+        rateLimiter.acquire()
+
+        if (willCompleteAfterDeadline(deadline)) {
+            logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough rps tokens")
+            paymentESService.update(paymentId) {
+                it.logProcessing(success =false, now(), transactionId, reason = "Request would complete after deadline. No point in processing")
+            }
+
+            semaphore.release()
+            return
         }
 
         val request = Request.Builder().run {
@@ -98,6 +119,12 @@ class PaymentExternalSystemAdapterImpl(
         } finally {
             semaphore.release()
         }
+    }
+
+    private fun willCompleteAfterDeadline(deadline: Long): Boolean {
+        val expectedEnd = now() + requestAverageProcessingTime.toMillis() * 2
+
+        return expectedEnd >= deadline
     }
 
     override fun price() = properties.price
