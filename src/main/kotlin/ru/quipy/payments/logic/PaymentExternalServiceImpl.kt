@@ -73,6 +73,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logProcessing(success =false, now(), transactionId, reason = "Request would complete after deadline. No point in processing")
             }
 
+            rateLimiter.release()
             semaphore.release()
             return
         }
@@ -156,6 +157,15 @@ class RateLimiter(private val permitsPerSecond: Int) {
                         if (waitTime > 0) delay(waitTime)
                     }
                 }
+            }
+        }
+    }
+
+    suspend fun release() {
+        mutex.withLock {
+            availableTokens++
+            if (availableTokens > permitsPerSecond) {
+                availableTokens--
             }
         }
     }
