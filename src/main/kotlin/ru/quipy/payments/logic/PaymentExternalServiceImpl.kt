@@ -41,11 +41,10 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(parallelRequests)
     private val rateLimiter = RateLimiter(rateLimitPerSec)
 
+    private val maxRetryCount = 2;
+
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-        rateLimiter.acquire()
-        semaphore.acquire()
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
@@ -55,49 +54,100 @@ class PaymentExternalSystemAdapterImpl(
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
+        var retryCount = 0
 
-        val request = Request.Builder().run {
-            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
+        while (retryCount <= maxRetryCount) {
+            var shouldRetry = false
 
-        try {
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+            semaphore.acquire()
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-            }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+            try {
+                if (willCompleteAfterDeadline(deadline)) {
+                    logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough parallel requests")
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        it.logProcessing(success = false, now(), transactionId, reason = "Request would complete after deadline. No point in processing")
                     }
+                    break
                 }
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                rateLimiter.acquire()
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                try {
+                    if (willCompleteAfterDeadline(deadline)) {
+                        logger.error("[$accountName] Payment would complete after deadline for txId: $transactionId, payment: $paymentId, stage: enough rps tokens")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(success = false, now(), transactionId, reason = "Request would complete after deadline. No point in processing")
+                        }
+                        break
                     }
+
+                    val request = Request.Builder().run {
+                        url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                        post(emptyBody)
+                    }.build()
+
+                    try {
+                        client.newCall(request).execute().use { response ->
+                            val body = try {
+                                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            }
+
+                            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                            }
+
+                            if (body.result) {
+                                return
+                            } else {
+                                shouldRetry = retryCount < maxRetryCount
+                                if (shouldRetry) {
+                                    retryCount++
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        when (e) {
+                            is SocketTimeoutException -> {
+                                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                                }
+                            }
+                            else -> {
+                                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                                }
+                            }
+                        }
+
+                        shouldRetry = retryCount < maxRetryCount
+                        if (shouldRetry) {
+                            retryCount++
+                        }
+                    }
+                } finally {
+                    rateLimiter.release()
                 }
+            } finally {
+                semaphore.release()
             }
-        } finally {
-            semaphore.release()
+
+            if (!shouldRetry) {
+                break
+            }
         }
+    }
+
+    private fun willCompleteAfterDeadline(deadline: Long): Boolean {
+        val expectedEnd = now() + requestAverageProcessingTime.toMillis() * 2
+
+        return expectedEnd >= deadline
     }
 
     override fun price() = properties.price
@@ -129,6 +179,15 @@ class RateLimiter(private val permitsPerSecond: Int) {
                         if (waitTime > 0) delay(waitTime)
                     }
                 }
+            }
+        }
+    }
+
+    suspend fun release() {
+        mutex.withLock {
+            availableTokens++
+            if (availableTokens > permitsPerSecond) {
+                availableTokens--
             }
         }
     }
