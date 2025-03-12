@@ -9,12 +9,16 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okio.IOException
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
-import java.util.*
+import java.util.ArrayDeque
+import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -48,6 +52,8 @@ class PaymentExternalSystemAdapterImpl(
         maxLookupInPastSeconds = 600,
         maxRequestCount = 10_000
     )
+
+    private val executor = Executors.newScheduledThreadPool(parallelRequests)
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -93,9 +99,15 @@ class PaymentExternalSystemAdapterImpl(
                     }.build()
 
                     try {
-                        val requestStartTime = now()
+                        val call = client.newCall(request)
 
-                        client.newCall(request).execute().use { response ->
+                        val delay = averageProcessingTimeCalculator.getAverage() * 2.5
+                        executor.schedule({
+                            call.cancel()
+                        }, delay.toLong(), TimeUnit.MILLISECONDS)
+
+                        val requestStartTime = now()
+                        call.execute().use { response ->
                             val body = try {
                                 mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                             } catch (e: Exception) {
@@ -127,6 +139,10 @@ class PaymentExternalSystemAdapterImpl(
                                 paymentESService.update(paymentId) {
                                     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                                 }
+                            }
+                            is IOException -> {
+                                logger.warn("[$accountName] Payment send request timeout for txId: $transactionId, payment: $paymentId")
+                                retryCount++
                             }
                             else -> {
                                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
