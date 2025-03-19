@@ -45,7 +45,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    private val semaphore = PrioritySemaphore(5)
+    private val semaphore = PrioritySemaphore(parallelRequests)
     private val rateLimiter = RateLimiter(rateLimitPerSec)
 
     private val maxRetryCount = 4;
