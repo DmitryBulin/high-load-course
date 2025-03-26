@@ -179,7 +179,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun willCompleteAfterDeadline(deadline: Long): Boolean {
+    private suspend fun willCompleteAfterDeadline(deadline: Long): Boolean {
         val expectedEnd = now() + processingTimeCalculator.getMedian() * 2
 
         return expectedEnd >= deadline
@@ -239,18 +239,21 @@ class RateLimiter(private val permitsPerSecond: Int) {
 class ResponseTimeCalculator(private val initialAverage: Long, private val maxLookupInPastSeconds: Long, private val maxRequestCount: Long) {
     private data class Request(val finishedAt: Long, val duration: Long)
 
-    private val requests = ArrayDeque<Request>()
+    private val requests = ArrayDeque<Request>(maxRequestCount.toInt())
+    private val mutex = Mutex()
 
-    fun onRequestFinished(start: Long, end: Long) {
+    suspend fun onRequestFinished(start: Long, end: Long) {
         val duration = end - start
         requests.addLast(Request(end, duration))
 
+        mutex.lock()
         while (requests.size > maxRequestCount) {
             requests.removeFirst()
         }
+        mutex.unlock()
     }
 
-    fun getMedian(): Long {
+    suspend fun getMedian(): Long {
         cleanup()
 
         if (requests.count() < 3) return initialAverage
@@ -259,18 +262,24 @@ class ResponseTimeCalculator(private val initialAverage: Long, private val maxLo
 
         val size = sorted.size
 
-        return if (size % 2 == 1) {
+        mutex.lock()
+        val result = if (size % 2 == 1) {
             sorted[size / 2]
         } else {
             (sorted[(size / 2) - 1] + sorted[size / 2]) / 2
         }
+        mutex.unlock()
+
+        return result
     }
 
-    private fun cleanup() {
+    private suspend fun cleanup() {
+        mutex.lock()
         val cutoff = now() - maxLookupInPastSeconds * 1_000
         while (requests.isNotEmpty() && requests.first().finishedAt < cutoff) {
             requests.removeFirst()
         }
+        mutex.unlock()
     }
 }
 
