@@ -43,6 +43,12 @@ class PaymentExternalSystemAdapterImpl(
 
     private val maxRetryCount = 2;
 
+    private val averageProcessingTimeCalculator = AverageResponseTimeCalculator(
+        initialAverage = requestAverageProcessingTime.toMillis(),
+        maxLookupInPastSeconds = 600,
+        maxRequestCount = 10_000
+    )
+
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -87,6 +93,8 @@ class PaymentExternalSystemAdapterImpl(
                     }.build()
 
                     try {
+                        val requestStartTime = now()
+
                         client.newCall(request).execute().use { response ->
                             val body = try {
                                 mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -94,6 +102,8 @@ class PaymentExternalSystemAdapterImpl(
                                 logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                             }
+
+                            averageProcessingTimeCalculator.onRequestFinished(requestStartTime, now())
 
                             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
@@ -145,7 +155,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun willCompleteAfterDeadline(deadline: Long): Boolean {
-        val expectedEnd = now() + requestAverageProcessingTime.toMillis() * 2
+        val expectedEnd = now() + averageProcessingTimeCalculator.getAverage() * 2
 
         return expectedEnd >= deadline
     }
@@ -197,6 +207,43 @@ class RateLimiter(private val permitsPerSecond: Int) {
         if (now >= nextRefillTime) {
             availableTokens = permitsPerSecond
             nextRefillTime = now + 1000
+        }
+    }
+}
+
+class AverageResponseTimeCalculator(
+    private val initialAverage: Long,
+    private val maxLookupInPastSeconds: Long,
+    private val maxRequestCount: Long
+) {
+    private data class Request(val finishedAt: Long, val duration: Long)
+
+    private val requests = ArrayDeque<Request>()
+
+    fun onRequestFinished(start: Long, end: Long) {
+        val duration = end - start
+        requests.addLast(Request(end, duration))
+
+        while (requests.size > maxRequestCount) {
+            requests.removeFirst()
+        }
+    }
+
+    fun getAverage(): Long {
+        cleanup()
+
+        return if (requests.isEmpty()) {
+            initialAverage
+        } else {
+            val total = requests.sumOf { it.duration }
+            total / requests.size
+        }
+    }
+
+    private fun cleanup() {
+        val cutoff = now() - maxLookupInPastSeconds * 1_000
+        while (requests.isNotEmpty() && requests.first().finishedAt < cutoff) {
+            requests.removeFirst()
         }
     }
 }
