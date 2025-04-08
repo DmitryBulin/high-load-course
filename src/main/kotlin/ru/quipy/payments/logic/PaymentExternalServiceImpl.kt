@@ -9,13 +9,21 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.ConnectionPool
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
 import okio.IOException
+import org.eclipse.jetty.client.HttpClient
+import org.eclipse.jetty.http.HttpMethod
+import org.eclipse.jetty.http.HttpVersion
+import org.eclipse.jetty.http2.client.HTTP2Client
+import org.eclipse.jetty.http2.client.http.HttpClientTransportOverHTTP2
+import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
 import java.time.Duration
 import java.util.ArrayDeque
 import java.util.UUID
@@ -38,7 +46,6 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
-        val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
@@ -48,34 +55,35 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val dispatcher = Dispatcher()
-    init {
-        dispatcher.maxRequests = 1_000
-        dispatcher.maxRequestsPerHost = 100
+    private val http2Client = HTTP2Client()
+    private val transport = HttpClientTransportOverHTTP2(http2Client).apply {
+        isUseALPN = false
     }
-    private val connectionPool = ConnectionPool(
-        maxIdleConnections = 10_000,
-        keepAliveDuration = 15,
-        timeUnit = TimeUnit.MINUTES,
-    )
-    private val client = OkHttpClient.Builder()
-        .dispatcher(dispatcher)
-        .connectionPool(connectionPool)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val httpClient = HttpClient(transport).apply {
+        executor = QueuedThreadPool().apply {
+            maxThreads = 30_000
+            minThreads = 20_000
+        }
+
+        maxConnectionsPerDestination = 20_000
+        maxRequestsQueuedPerDestination = 20_000
+
+        idleTimeout = 15 * 60 * 1_000
+        connectTimeout = 30 * 1_000
+
+        start()
+    }
 
     private val semaphore = Semaphore(parallelRequests)
     private val rateLimiter = RateLimiter(rateLimitPerSec)
 
-    private val maxRetryCount = 4;
+    private val maxRetryCount = 4
 
     private val processingTimeCalculator = ResponseTimeCalculator(
         initialAverage = requestAverageProcessingTime.toMillis(),
         maxLookupInPastSeconds = 600,
         maxRequestCount = 100_000
     )
-
-    private val executor = Executors.newScheduledThreadPool(1_000)
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         //logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -122,39 +130,35 @@ class PaymentExternalSystemAdapterImpl(
                     return
                 }
 
-                val request = Request.Builder().run {
-                    url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
+                val url = "http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
 
-                val call = client.newCall(request)
-
-                val delay = processingTimeCalculator.getMedian() * 3
-                val cancellationTask = executor.schedule({ call.cancel() }, delay.toLong(), TimeUnit.MILLISECONDS)
+                val request = httpClient.newRequest(url).apply {
+                    method(HttpMethod.POST)
+                    version(HttpVersion.HTTP_2)
+                    timeout(processingTimeCalculator.getMedian() * 3, TimeUnit.MILLISECONDS)
+                }
 
                 val requestStartTime = now()
-                call.execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        //logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+                val response = request.send()
 
-                    cancellationTask.cancel(true)
+                val body = try {
+                    mapper.readValue(response.contentAsString, ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    //logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
 
-                    //logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                //logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
 
-                    if (body.result) {
-                        processingTimeCalculator.onRequestFinished(requestStartTime, now())
-                        return
-                    } else {
-                        shouldRetry = true
-                    }
+                if (body.result) {
+                    processingTimeCalculator.onRequestFinished(requestStartTime, now())
+                    return
+                } else {
+                    shouldRetry = true
                 }
             } catch (e: Exception) {
                 when (e) {
