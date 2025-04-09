@@ -28,8 +28,8 @@ class PaymentSystemImpl(
     }
 
     private val pool = ThreadPoolExecutor(
-        100,
-        200,
+        10_000,
+        20_000,
         15,
         TimeUnit.MINUTES,
         PriorityBlockingQueue(),
